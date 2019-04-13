@@ -1,11 +1,25 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
-# 2014-07-11 DHT22.py
+# 2019-04-07 DHT22.py
 
 import time
-import atexit
-
+#import atexit
 import pigpio
+import json
+import os
+import sys
+import datetime
+from pytz import timezone
+from tzlocal import get_localzone
+
+def set_procname(newname):
+  from ctypes import cdll, byref, create_string_buffer
+  libc = cdll.LoadLibrary('libc.so.6')    #Loading a 3rd party library C
+  buff = create_string_buffer(len(newname)+1) #Note: One larger than the name (man prctl says that)
+  buff.value = newname                 #Null terminated string as it should be
+  libc.prctl(15, byref(buff), 0, 0, 0) #Refer to "#define" of "/usr/include/linux/prctl.h" for the misterious value 16 & arg[3..5] are zero as the man page says.
+
+set_procname(b"DHT22")
 
 class sensor:
    """
@@ -32,7 +46,7 @@ class sensor:
    gpio ------------+
    """
 
-   def __init__(self, pi, gpio, LED=None, power=None):
+   def __init__(self, pi, gpio, LED=None, power=None, filename=None):
       """
       Instantiate with the Pi and gpio to which the DHT22 output
       pin is connected.
@@ -52,6 +66,19 @@ class sensor:
       self.gpio = gpio
       self.LED = LED
       self.power = power
+      self.f = None
+      self.ftemp = None
+      self.fhum = None
+      self.time = None
+      
+      if filename is not None:
+         self.f = open(filename,"a+")
+
+      if filename is not None:
+         self.ftemp = open(filename+"-temperature","a+")
+
+      if filename is not None:
+         self.fhum = open(filename+"-humidity","a+")
 
       if power is not None:
          pi.write(power, 1)  # Switch sensor on.
@@ -61,7 +88,7 @@ class sensor:
 
       self.cb = None
 
-      atexit.register(self.cancel)
+      #atexit.register(self.cancel)
 
       self.bad_CS = 0  # Bad checksum count.
       self.bad_SM = 0  # Short message count.
@@ -74,6 +101,7 @@ class sensor:
 
       self.rhum = -999
       self.temp = -999
+      self.count = 0
 
       self.tov = None
 
@@ -91,104 +119,121 @@ class sensor:
       Accumulate the 40 data bits.  Format into 5 bytes, humidity high,
       humidity low, temperature high, temperature low, checksum.
       """
-      diff = pigpio.tickDiff(self.high_tick, tick)
+      try:
+      
+         diff = pigpio.tickDiff(self.high_tick, tick)
 
-      if level == 0:
+         if level == 0:
 
-         # Edge length determines if bit is 1 or 0.
+            # Edge length determines if bit is 1 or 0.
 
-         if diff >= 50:
-            val = 1
-            if diff >= 200:   # Bad bit?
-               self.CS = 256  # Force bad checksum.
-         else:
-            val = 0
+            if diff >= 50:
+               val = 1
+               if diff >= 200:   # Bad bit?
+                  self.CS = 256  # Force bad checksum.
+            else:
+               val = 0
 
-         if self.bit >= 40:  # Message complete.
-            self.bit = 40
+            if self.bit >= 40:  # Message complete.
+               self.bit = 40
 
-         elif self.bit >= 32:  # In checksum byte.
-            self.CS  = (self.CS << 1)  + val
+            elif self.bit >= 32:  # In checksum byte.
+               self.CS  = (self.CS << 1)  + val
 
-            if self.bit == 39:
+               if self.bit == 39:
 
-               # 40th bit received.
+                  # 40th bit received.
 
-               self.pi.set_watchdog(self.gpio, 0)
+                  self.pi.set_watchdog(self.gpio, 0)
 
-               self.no_response = 0
+                  self.no_response = 0
 
-               total = self.hH + self.hL + self.tH + self.tL
+                  total = self.hH + self.hL + self.tH + self.tL
 
-               if (total & 255) == self.CS:  # Is checksum ok?
+                  if (total & 255) == self.CS:  # Is checksum ok?
 
-                  self.rhum = ((self.hH << 8) + self.hL) * 0.1
+                     self.rhum = round(((self.hH << 8) + self.hL) * 0.1, 6)
 
-                  if self.tH & 128:  # Negative temperature.
-                     mult = -0.1
-                     self.tH = self.tH & 127
+                     if self.tH & 128:  # Negative temperature.
+                        mult = -0.1
+                        self.tH = self.tH & 127
+                     else:
+                        mult = 0.1
+                        
+                     self.time = datetime.datetime.now()
+
+                     self.temp = round(((self.tH << 8) + self.tL) * mult, 6)
+
+                     self.tov = time.time()
+                     
+                     self.count += 1
+
+                     if self.LED is not None:
+                        self.pi.write(self.LED, 0)
+                        
+                     if self.f is not None:
+                        self.writefile()
+
                   else:
-                     mult = 0.1
 
-                  self.temp = ((self.tH << 8) + self.tL) * mult
+                     self.bad_CS += 1
 
-                  self.tov = time.time()
+            elif self.bit >= 24:  # in temp low byte
+               self.tL = (self.tL << 1) + val
 
-                  if self.LED is not None:
-                     self.pi.write(self.LED, 0)
+            elif self.bit >= 16:  # in temp high byte
+               self.tH = (self.tH << 1) + val
 
-               else:
+            elif self.bit >= 8:  # in humidity low byte
+               self.hL = (self.hL << 1) + val
 
-                  self.bad_CS += 1
+            elif self.bit >= 0:  # in humidity high byte
+               self.hH = (self.hH << 1) + val
 
-         elif self.bit >= 24:  # in temp low byte
-            self.tL = (self.tL << 1) + val
+            else:               # header bits
+               pass
 
-         elif self.bit >= 16:  # in temp high byte
-            self.tH = (self.tH << 1) + val
+            self.bit += 1
 
-         elif self.bit >= 8:  # in humidity low byte
-            self.hL = (self.hL << 1) + val
+         elif level == 1:
+            self.high_tick = tick
+            if diff > 250000:
+               self.bit = -2
+               self.hH = 0
+               self.hL = 0
+               self.tH = 0
+               self.tL = 0
+               self.CS = 0
 
-         elif self.bit >= 0:  # in humidity high byte
-            self.hH = (self.hH << 1) + val
-
-         else:               # header bits
-            pass
-
-         self.bit += 1
-
-      elif level == 1:
-         self.high_tick = tick
-         if diff > 250000:
-            self.bit = -2
-            self.hH = 0
-            self.hL = 0
-            self.tH = 0
-            self.tL = 0
-            self.CS = 0
-
-      else:  # level == pigpio.TIMEOUT:
-         self.pi.set_watchdog(self.gpio, 0)
-         if self.bit < 8:       # Too few data bits received.
-            self.bad_MM += 1    # Bump missing message count.
-            self.no_response += 1
-            if self.no_response > self.MAX_NO_RESPONSE:
+         else:  # level == pigpio.TIMEOUT:
+            self.pi.set_watchdog(self.gpio, 0)
+            if self.bit < 8:       # Too few data bits received.
+               self.bad_MM += 1    # Bump missing message count.
+               self.no_response += 1
+               if self.no_response > self.MAX_NO_RESPONSE:
+                  self.no_response = 0
+                  self.bad_SR += 1  # Bump sensor reset count.
+                  if self.power is not None:
+                     self.powered = False
+                     self.pi.write(self.power, 0)
+                     time.sleep(2)
+                     self.pi.write(self.power, 1)
+                     time.sleep(2)
+                     self.powered = True
+            elif self.bit < 39:    # Short message receieved.
+               self.bad_SM += 1    # Bump short message count.
                self.no_response = 0
-               self.bad_SR += 1  # Bump sensor reset count.
-               if self.power is not None:
-                  self.powered = False
-                  self.pi.write(self.power, 0)
-                  time.sleep(2)
-                  self.pi.write(self.power, 1)
-                  time.sleep(2)
-                  self.powered = True
-         elif self.bit < 39:    # Short message receieved.
-            self.bad_SM += 1    # Bump short message count.
-            self.no_response = 0
 
-         else:                  # Full message received.
-            self.no_response = 0
+            else:                  # Full message received.
+               self.no_response = 0
+
+      except Exception as e:
+         exc_type, exc_obj, exc_tb = sys.exc_info()
+         fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+         print("Exception: {0}".format(e))
+         print(exc_type, fname, exc_tb.tb_lineno)
+         sys.stdout.flush()
+         pass
 
    def temperature(self):
       """Return current temperature."""
@@ -221,6 +266,44 @@ class sensor:
       """Return count of power cycles because of sensor hangs."""
       return self.bad_SR
 
+   def writefile(self):
+      try: 
+         data = { 
+            "count": self.count, 
+            "time": self.time.isoformat(),
+            "humidity": self.rhum,
+            "temperature": self.temp,
+            "staleness": self.staleness(),
+            "bad_checksum": self.bad_CS,
+            "short_message": self.bad_SM,
+            "missing_message": self.bad_MM,
+            "sensor_reset": self.bad_SR
+         }
+
+         self.f.seek(0)
+         self.f.truncate()
+         json.dump(data, self.f, indent=4)
+         self.f.flush()
+         
+         self.ftemp.seek(0)
+         self.ftemp.truncate()
+         self.ftemp.write(str(int(self.temp*1000)))
+         self.ftemp.flush()
+
+         self.fhum.seek(0)
+         self.fhum.truncate()
+         self.fhum.write(str(int(self.rhum*1000)))
+         self.fhum.flush()
+
+      except Exception as e:
+         exc_type, exc_obj, exc_tb = sys.exc_info()
+         fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+         print("Exception: {0}".format(e))
+         print(exc_type, fname, exc_tb.tb_lineno)
+         sys.stdout.flush()
+         pass
+
+
    def trigger(self):
       """Trigger a new relative humidity and temperature reading."""
       if self.powered:
@@ -241,41 +324,50 @@ class sensor:
          self.cb.cancel()
          self.cb = None
 
+      if self.f is not None:
+         self.f.close()
+         
+      if self.ftemp is not None:
+         self.ftemp.close()
+
+      if self.fhum is not None:
+         self.fhum.close()
+
 if __name__ == "__main__":
 
    import time
-
    import pigpio
-
    import DHT22
+   
+   print('START')
 
-   # Intervals of about 2 seconds or less will eventually hang the DHT22.
-   INTERVAL = 3
+   try:
 
-   pi = pigpio.pi()
+      # Intervals of about 2 seconds or less will eventually hang the DHT22.
+      INTERVAL = 2
 
-   s = DHT22.sensor(pi, 22, LED=16, power=8)
+      pi = pigpio.pi()
 
-   r = 0
+      s = DHT22.sensor(pi, 7, filename="/dev/shm/DHT22")#, LED=16, power=8)
 
-   next_reading = time.time()
+      while True:
 
-   while True:
+         s.trigger()
+         
+         time.sleep(2)
 
-      r += 1
+   except KeyboardInterrupt:
+      print('SIGINT termination')
+      pass
 
-      s.trigger()
-
-      time.sleep(0.2)
-
-      print("{} {} {} {:3.2f} {} {} {} {}".format(
-         r, s.humidity(), s.temperature(), s.staleness(),
-         s.bad_checksum(), s.short_message(), s.missing_message(),
-         s.sensor_resets()))
-
-      next_reading += INTERVAL
-
-      time.sleep(next_reading-time.time())  # Overall INTERVAL second polling.
+   except Exception as e:
+      exc_type, exc_obj, exc_tb = sys.exc_info()
+      fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+      print("Exception: {0}".format(e))
+      print(exc_type, fname, exc_tb.tb_lineno)
+      sys.stdout.flush()
+      pass
+   
 
    s.cancel()
 
